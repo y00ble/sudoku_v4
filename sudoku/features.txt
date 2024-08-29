@@ -1,0 +1,9 @@
+Bifurcation as a tree, only need to remember bifurcations at the current level
+Contradictions as a graph (adjacency matrix?) for easy removal after finalisations
+Coverees as in V3
+Detection of pointing coverees by querying neighbourhoods
+Constraints that can act freely on the board
+    - At the start, adding coverees
+    - In the middle, editing possibles
+
+Detection of pairs/triples??
