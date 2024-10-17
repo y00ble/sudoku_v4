@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from sudoku.exceptions import SudokuContradiction
+
 if TYPE_CHECKING:
     from .puzzle import DIGITS, Puzzle
 
@@ -17,8 +19,9 @@ class Constraint(ABC):
     def __init__(self, puzzle: Puzzle, cells: list[tuple]):
         self.puzzle = puzzle
         self.cells = np.array(cells)
+        puzzle.constraints.append(self)
         self.add_contradictions()
-        self.restrict_possibles()
+        self.initialise_on_grid()
 
     @abstractmethod
     def add_contradictions(self) -> None:
@@ -26,9 +29,17 @@ class Constraint(ABC):
         ...
 
     @abstractmethod
-    def restrict_possibles(self) -> None:
+    def initialise_on_grid(self) -> None:
         """Mark some of the puzzle's numbers as impossible."""
         ...
+
+    def act_on_grid(self) -> None:
+        """
+        Update the grid's possibles and finalised state.
+
+        Called periodically thoughout the solve.
+        """
+        pass
 
 
 class NoRepeatsConstraint(Constraint):
@@ -40,7 +51,7 @@ class NoRepeatsConstraint(Constraint):
                 i2 = self.puzzle.possible_index(*c2, value)
                 self.puzzle.add_contradiction(i1, i2)
 
-    def restrict_possibles(self) -> None:
+    def initialise_on_grid(self) -> None:
         pass
 
 
@@ -67,7 +78,7 @@ class Box(NoRepeatsConstraint):
 
 class GermanWhisper(Constraint):
 
-    def restrict_possibles(self) -> None:
+    def initialise_on_grid(self) -> None:
         indices = [
             self.puzzle.possible_index(row, col, 5) for row, col in self.cells
         ]
@@ -89,7 +100,7 @@ class NoX(Constraint):
         cells = [(i, j) for i in range(1, 10) for j in range(1, 10)]
         super().__init__(puzzle, cells)
 
-    def restrict_possibles(self):
+    def initialise_on_grid(self):
         pass
 
     def add_contradictions(self):
@@ -126,3 +137,111 @@ class NoX(Constraint):
                             row + 1, col, low_summand
                         )
                         self.puzzle.add_contradiction(i1, i2)
+
+
+class RegionCountConstraint(Constraint):
+    def __init__(
+        self, puzzle: Puzzle, cells: list[tuple[int]], counts: dict[int, int]
+    ):
+        self.counts_array = np.array([counts.get(i, 0) for i in DIGITS])
+        self.indices = puzzle.get_indices_for_cells(cells)
+        super().__init__(puzzle, cells)
+
+    def initialise_on_grid(self) -> None:
+        indices_to_remove = []
+        for digit, count in zip(DIGITS, self.counts_array):
+            if count == 0:
+                for cell in self.cells:
+                    index_to_remove = self.puzzle.possible_index(
+                        cell[0], cell[1], digit
+                    )
+                    indices_to_remove.append(index_to_remove)
+
+        self.puzzle.possibles[indices_to_remove] = False
+
+    def add_contradictions(self) -> None:
+        pass
+
+    def act_on_grid(self) -> None:
+        finalised = self.puzzle.finalised[self.indices]
+        counts = finalised.sum(axis=0)
+        if np.any(counts > self.counts_array):
+            raise SudokuContradiction("Specified region count exceeded!")
+
+
+class CountingCircles(Constraint):
+
+    def __init__(self, puzzle: Puzzle, cells: list[tuple[int]]):
+        super().__init__(puzzle, cells)
+        self.indices = puzzle.get_indices_for_cells(self.cells)
+        self.target_counts_array = np.arange(1, 10)
+
+    def initialise_on_grid(self) -> None:
+        pass
+
+    def add_contradictions(self) -> None:
+        tuple_cells = [tuple(row) for row in self.cells]
+        for c1 in tuple_cells:
+            for c2 in tuple_cells:
+                if np.all(c1 == c2):
+                    continue
+
+                i1 = self.puzzle.possible_index(*c1, 1)
+                i2 = self.puzzle.possible_index(*c2, 1)
+                self.puzzle.add_contradiction(i1, i2)
+
+        for c1 in tuple_cells:
+            for c2 in itertools.product(range(1, 10), repeat=2):
+                if c2 in tuple_cells:
+                    continue
+
+                i1 = self.puzzle.possible_index(*c1, 9)
+                i2 = self.puzzle.possible_index(*c2, 9)
+                self.puzzle.add_contradiction(i1, i2)
+
+    def act_on_grid(self) -> None:
+        finalised = self.puzzle.finalised[self.indices]
+        finalised_counts = finalised.sum(axis=0)
+        if np.any(finalised_counts > self.target_counts_array):
+            raise SudokuContradiction("Too many numbers inside circles")
+
+        possibles = self.puzzle.possibles[self.indices]
+        possible_counts = possibles.sum(axis=0)
+        if np.any(
+            (possible_counts < self.target_counts_array)
+            * (finalised_counts != 0)
+        ):
+            raise SudokuContradiction(
+                "Not enough possibles to satisfy circles."
+            )
+
+
+class KillerCage(NoRepeatsConstraint):
+
+    def __init__(self, puzzle: Puzzle, cells: list[tuple[int]], total: int):
+        super().__init__(puzzle, cells)
+        self.indices = puzzle.get_indices_for_cells(self.cells)
+        self.total = total
+
+    def act_on_grid(self) -> None:
+        possibles = self.puzzle.possibles[self.indices]
+        combined_possibles = np.sum(possibles, axis=0) > 0
+        values = combined_possibles * np.arange(1, 10)
+
+        cumsum = np.unique(np.cumsum(values))
+
+        if cumsum[0] == 0:
+            cumsum = cumsum[1:]
+
+        num_unique_possibles = len(cumsum)
+        if num_unique_possibles < len(self.cells):
+            raise SudokuContradiction("Not enough possibles left to fill cage.")
+
+        if cumsum[len(self.cells) - 1] > self.total:
+            raise SudokuContradiction("Minimum cage total too big.")
+
+        starting_cumsum = 0
+        if len(self.cells) < len(cumsum):
+            starting_cumsum = cumsum[-len(self.cells) - 1]
+        if cumsum[-1] - starting_cumsum < self.total:
+            raise SudokuContradiction("Maximum cage total too small.")

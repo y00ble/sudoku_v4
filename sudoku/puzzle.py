@@ -4,6 +4,7 @@ import collections
 import contextlib
 import copy
 import curses
+import datetime
 import itertools
 import time
 
@@ -21,7 +22,8 @@ NUM_POSSIBLES = NUM_CELLS * NUM_DIGITS
 MAX_COVEREE_SIZE = 9
 
 Bifurcation = collections.namedtuple(
-    "Bifurcation", ["index", "possibles", "finalised"]
+    "Bifurcation",
+    ["index", "possibles", "finalised", "num_options", "current_option_num"],
 )
 
 
@@ -32,6 +34,8 @@ class Puzzle:
         self.finalised = np.zeros(NUM_POSSIBLES + 1).astype(bool)
         self.in_valid_solutions = np.zeros(NUM_POSSIBLES + 1)
         self.possibles[-1] = False
+
+        self.constraints = []
 
         self.unbifurcated_possibles = self.possibles
 
@@ -45,26 +49,28 @@ class Puzzle:
         self.solutions = set()
         self.last_frame_time = 0
         self.bifurcations = []
+        self.solve_start_time = 0
         self._init_grid_constraints()
 
     def solve(self, with_terminal=False):
-        # TODO detect multiple solutions
         # TODO error handling for impossible puzzles
+        self.solve_start_time = time.time()
         try:
             if with_terminal:
                 curses.wrapper(self._solve)
             else:
                 self._solve()
         finally:
-            print(
-                "{} {} found!".format(
-                    len(self.solutions),
-                    "solution" if len(self.solutions) == 1 else "solutions",
+            if with_terminal:
+                print(
+                    "{} {} found!".format(
+                        len(self.solutions),
+                        "solution" if len(self.solutions) == 1 else "solutions",
+                    )
                 )
-            )
-            for i, solution in enumerate(self.solutions):
-                print(f"SOLUTION {i}".center(30, "-"))
-                self.simple_draw(solution)
+                for i, solution in enumerate(self.solutions):
+                    print(f"SOLUTION {i}".center(30, "-"))
+                    self.simple_draw(solution)
 
     def _solve(self, screen=None):
         self.screen = screen
@@ -76,15 +82,15 @@ class Puzzle:
         if self.is_finished:
             return
         idxs_to_bifurcate = self._select_bifurcation_coveree()
-        idxs_to_remove = []
-        for idx in idxs_to_bifurcate:
+        for bifurcation_num, idx in enumerate(idxs_to_bifurcate):
             try:
-                with self._bifurcate(idx):
+                with self._bifurcate(
+                    idx, len(idxs_to_bifurcate), bifurcation_num
+                ):
                     self._solve_or_bifurcate()
             except SudokuContradiction:
-                idxs_to_remove.append(idx)
+                self.possibles[idx] = False
 
-        self.possibles[idxs_to_remove] = False
         self._logical_solve_til_no_change()
 
     def _logical_solve_til_no_change(self):
@@ -97,6 +103,8 @@ class Puzzle:
             # leading to each contradictions, compare to coveree length).
             # TODO add pair detection?? Seems costly
             # TODO add constraints like KillerCages that check for validity.
+            for constraint in self.constraints:
+                constraint.act_on_grid()
             self.process_singleton_coverees()
             self._refresh_screen()
             old_possibles = tuple(self.possibles)
@@ -129,6 +137,10 @@ class Puzzle:
     def _select_bifurcation_coveree(self) -> list[int]:
         possible_mask = self.possibles[self.coverees]
         remaining_coverees = self.coverees * possible_mask - (1 - possible_mask)
+
+        finalised_msak = np.any(self.finalised[remaining_coverees], axis=1)
+        remaining_coverees[finalised_msak] = -1
+
         coveree_counts = (remaining_coverees != -1).sum(axis=1)
         coveree_counts[coveree_counts < 2] = MAX_COVEREE_SIZE + 1
         min_coveree_size = coveree_counts.min()
@@ -151,18 +163,23 @@ class Puzzle:
         return output
 
     @contextlib.contextmanager
-    def _bifurcate(self, index):
+    def _bifurcate(self, index: int, num_options: int, current_num: int):
         bifurcation = Bifurcation(
             index=index,
             possibles=self.possibles,
             finalised=self.finalised,
+            num_options=num_options,
+            current_option_num=current_num,
         )
         self.possibles = copy.deepcopy(self.possibles)
         self.finalised = copy.deepcopy(self.finalised)
         try:
             self.bifurcations.append(bifurcation)
+            debug_solutions_before_bifurcate = len(self.solutions)
             self.finalise([index])
             yield
+        except SudokuContradiction:
+            raise
         finally:
             self.bifurcations.pop()
             self.possibles = bifurcation.possibles
@@ -170,9 +187,6 @@ class Puzzle:
 
     def finalise(self, possible_indices: list[int]) -> None:
         """Mark the given possibles as finalised."""
-        if self.is_finished:
-            self._add_solution(self.possibles)
-            return
         not_yet_finalised = [
             idx for idx in possible_indices if not self.finalised[idx]
         ]
@@ -185,6 +199,13 @@ class Puzzle:
         if np.any(self.finalised[adjacent_contradictions]):
             raise SudokuContradiction("Trying to remove finalised digit!")
         self.possibles[adjacent_contradictions] = False
+
+        if self.is_finished:
+            # Final check for contradictions in constraints.
+            self._logical_solve_til_no_change()
+            self._add_solution(self.possibles)
+            return
+
         self.process_singleton_coverees()
 
     def _add_solution(self, indices):
@@ -196,6 +217,8 @@ class Puzzle:
         possible_mask = self.possibles[self.coverees]
         remaining_coverees = self.coverees * possible_mask - (1 - possible_mask)
         coveree_counts = (remaining_coverees != -1).sum(axis=1)
+        if np.any(coveree_counts == 0):
+            raise SudokuContradiction("Coveree no longer possible")
         singleton_coverees = remaining_coverees[coveree_counts == 1]
         indices = np.unique(singleton_coverees).tolist()
         if indices:
@@ -246,6 +269,18 @@ class Puzzle:
     @staticmethod
     def _cell_start_index(row: int, col: int) -> int:
         return (row - 1) * 81 + (col - 1) * 9
+
+    @staticmethod
+    def get_indices_for_cells(cells: list[tuple[int]]):
+        """Make a 2D array where each row is a cell's slice of 'finalised'."""
+        cells_as_array = np.array(cells)
+        cell_indices = (
+            (cells_as_array[:, 0] - 1) * 81 + (cells_as_array[:, 1] - 1) * 9
+        ).reshape((len(cells), 1))
+        possible_indices = cell_indices + np.tile(
+            np.arange(0, 9), (len(cells), 1)
+        )
+        return possible_indices
 
     @staticmethod
     def possible_index(row: int, col: int, possible: int) -> int:
@@ -302,7 +337,12 @@ class Puzzle:
             0,
             "==={} SOLUTIONS, BIFURCATION STATUS {}".format(
                 len(self.solutions),
-                ",".join([str(b.possibles.sum()) for b in self.bifurcations]),
+                ",".join(
+                    [
+                        f"{b.current_option_num + 1}/{b.num_options}"
+                        for b in self.bifurcations
+                    ]
+                ),
             ).ljust((9 * 9) + 6 + 2 * 3, "="),
         )
 
@@ -344,7 +384,36 @@ class Puzzle:
                     curses.color_pair(1 if first_bifurcation else 2),
                 )
 
+        status_string = (
+            f"Progress {self.progress * 100:.2f}%. "
+            f"Projected finish time {self.projected_finish}."
+        )
+        self.screen.addstr(
+            12, 0, f"==={status_string}".ljust((9 * 9) + 6 + 2 * 3, "=")
+        )
         self.screen.refresh()
+
+    @property
+    def progress(self):
+        registered_progress = 0
+        current_subdivision = 1
+        for bifurcation in self.bifurcations:
+            registered_progress += (
+                bifurcation.current_option_num / bifurcation.num_options
+            ) * current_subdivision
+            current_subdivision *= 1 / bifurcation.num_options
+
+        return registered_progress
+
+    @property
+    def projected_finish(self):
+        progress = self.progress
+        if progress == 0:
+            return "N/A"
+        time_elapsed = time.time() - self.solve_start_time
+        total_time = time_elapsed / progress
+        finish_timestamp = self.solve_start_time + total_time
+        return datetime.datetime.fromtimestamp(finish_timestamp).isoformat()
 
     @staticmethod
     def _possibles_to_draw_coords(possibles: np.ndarray) -> np.ndarray:
