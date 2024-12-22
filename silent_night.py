@@ -39,4 +39,5 @@ GermanWhisper(puzzle, [(7, 8), (8, 8)])
 
 puzzle[7, 4] = 7
 
-puzzle.solve(with_terminal=True)
+if __name__ == "__main__":
+    puzzle.solve(multiprocess=True)

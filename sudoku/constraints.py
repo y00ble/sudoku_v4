@@ -100,10 +100,10 @@ class NoX(Constraint):
         cells = [(i, j) for i in range(1, 10) for j in range(1, 10)]
         super().__init__(puzzle, cells)
 
-    def initialise_on_grid(self):
+    def initialise_on_grid(self) -> None:
         pass
 
-    def add_contradictions(self):
+    def add_contradictions(self) -> None:
         for low_summand in range(1, 5):
             for col in DIGITS:
                 for row in DIGITS:
@@ -245,3 +245,110 @@ class KillerCage(NoRepeatsConstraint):
             starting_cumsum = cumsum[-len(self.cells) - 1]
         if cumsum[-1] - starting_cumsum < self.total:
             raise SudokuContradiction("Maximum cage total too small.")
+
+
+class CornerMark(Constraint):
+
+    def __init__(
+        self, puzzle: Puzzle, cells: list[tuple[int, int]], value: int
+    ):
+        self.indices = [
+            puzzle.possible_index(row, col, value) for row, col in cells
+        ]
+        super().__init__(puzzle, cells)
+
+    def add_contradictions(self) -> None:
+        self.puzzle.add_coveree(self.indices)
+
+    def initialise_on_grid(self):
+        pass
+
+
+class Wheel(Constraint):
+
+    def __init__(
+        self, puzzle: Puzzle, centre: tuple[int, int], values: list[int | None]
+    ):
+        row, col = centre
+        if {row, col}.intersection({1, 9}):
+            raise ValueError("Cannot place wheels in R1, R9, C1 or C9.")
+        cells = [
+            (row - 1, col),
+            (row, col + 1),
+            (row + 1, col),
+            (row, col - 1),
+        ]
+        self.values = values
+        super().__init__(puzzle, cells)
+
+    def initialise_on_grid(self) -> None:
+        possibles_to_remove = [
+            self.puzzle.possible_index(row, col, value)
+            for row, col in self.cells
+            for value in range(1, 10)
+            if value not in self.values
+        ]
+
+        self.puzzle.possibles[possibles_to_remove] = False
+
+    def add_contradictions(self) -> None:
+        for value_idx_1, value_idx_2 in itertools.combinations(range(4), 2):
+            expected_diff = (value_idx_2 - value_idx_1) % 4
+            for cell_idx_1, cell_idx_2 in itertools.product(range(4), repeat=2):
+                if cell_idx_1 == cell_idx_2:
+                    continue
+                actual_diff = (cell_idx_2 - cell_idx_1) % 4
+
+                if actual_diff != expected_diff:
+                    i1 = self.puzzle.possible_index(
+                        *self.cells[cell_idx_1], self.values[value_idx_1]
+                    )
+                    i2 = self.puzzle.possible_index(
+                        *self.cells[cell_idx_2], self.values[value_idx_2]
+                    )
+                    self.puzzle.add_contradiction(i1, i2)
+
+
+class AntiKing(Constraint):
+
+    def __init__(self, puzzle: Puzzle):
+        super().__init__(
+            puzzle,
+            list(itertools.product(range(1, 10), repeat=2)),
+        )
+
+    def initialise_on_grid(self) -> None:
+        pass
+
+    def add_contradictions(self) -> None:
+        for r1, c1 in self.cells:
+            for r2, c2 in self.cells:
+                if r1 == r2 or c1 == c2:
+                    continue
+                if abs(r1 - r2) == 1 and abs(c1 - c2) == 1:
+                    for value in range(1, 10):
+                        i1 = self.puzzle.possible_index(r1, c1, value)
+                        i2 = self.puzzle.possible_index(r2, c2, value)
+                        self.puzzle.add_contradiction(i1, i2)
+
+
+class DiagonalNoBlackKropki(Constraint):
+
+    def __init__(self, puzzle: Puzzle):
+        super().__init__(
+            puzzle,
+            list(itertools.product(range(1, 10), repeat=2)),
+        )
+
+    def add_contradictions(self) -> None:
+        for r1, c1 in self.cells:
+            for r2, c2 in self.cells:
+                if abs(r1 - r2) <= 1 and abs(c1 - c2) <= 1:
+                    for v1, v2 in itertools.product(range(1, 10), repeat=2):
+                        i1 = self.puzzle.possible_index(r1, c1, v1)
+                        i2 = self.puzzle.possible_index(r2, c2, v2)
+                        if v1 * 3 == v2 or v2 * 3 == v1:
+                            self.puzzle.add_contradiction(i1, i2)
+
+    def initialise_on_grid(self) -> None:
+        pass

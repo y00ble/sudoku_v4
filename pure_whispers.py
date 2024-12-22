@@ -34,6 +34,8 @@ GermanWhisper(
     ],
 )
 GermanWhisper(puzzle, [(4, 5), (4, 6), (3, 7)])
+# GermanWhisper(puzzle, [(4, 5), (4, 6)])
 GermanWhisper(puzzle, [(5, 8), (6, 9), (7, 8), (7, 7), (8, 7), (9, 6)])
 
-puzzle.solve(with_terminal=True)
+if __name__ == "__main__":
+    puzzle.solve(multiprocess=True)

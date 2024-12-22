@@ -20,4 +20,5 @@ for i, digits in enumerate(givens):
             column = j + 1
             puzzle[row, column] = digit
 
-puzzle.solve(with_terminal=True)
+if __name__ == "__main__":
+    puzzle.solve(multiprocess=True)

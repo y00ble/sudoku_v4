@@ -77,4 +77,5 @@ CountingCircles(
 
 # puzzle[2, 2] = 9
 
-puzzle.solve(with_terminal=True)
+if __name__ == "__main__":
+    puzzle.solve(multiprocess=True)

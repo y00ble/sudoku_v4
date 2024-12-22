@@ -7,8 +7,10 @@ import curses
 import datetime
 import itertools
 import time
+from multiprocessing import Manager, Pool
 
 import numpy as np
+from nbformat import current_nbformat
 
 from sudoku.constraints import DIGITS, Box, Column, Row
 from sudoku.exceptions import SudokuContradiction
@@ -25,6 +27,8 @@ Bifurcation = collections.namedtuple(
     "Bifurcation",
     ["index", "possibles", "finalised", "num_options", "current_option_num"],
 )
+
+MULTIPROCESS_TASK_COUNT = 100
 
 
 class Puzzle:
@@ -50,48 +54,169 @@ class Puzzle:
         self.last_frame_time = 0
         self.bifurcations = []
         self.solve_start_time = 0
+
+        self.multiprocess_progress_dict = None
+        self.multiprocessing_id = None
+
         self._init_grid_constraints()
 
-    def solve(self, with_terminal=False):
+    def solve(self, with_terminal=False, multiprocess=False):
         # TODO error handling for impossible puzzles
+
+        if with_terminal and multiprocess:
+            raise ValueError(
+                "Can't specify both `with_terminal` and `multiprocess`."
+            )
+
         self.solve_start_time = time.time()
         try:
             if with_terminal:
                 curses.wrapper(self._solve)
+            elif multiprocess:
+                puzzle_copy = copy.deepcopy(self)
+                bifurcations_to_try = puzzle_copy._list_bifurcations() or [[]]
+                results = []
+                with Manager() as manager, Pool() as pool:
+                    progress_dict = manager.dict()
+                    for i, bifurcation_idxs in enumerate(bifurcations_to_try):
+                        puzzle = copy.deepcopy(self)
+                        puzzle.finalise(bifurcation_idxs)
+                        puzzle.multiprocess_progress_dict = progress_dict
+                        puzzle.multiprocessing_id = i
+                        results.append(pool.apply_async(puzzle._solve))
+
+                    time_started = time.time()
+                    total_progress = len(results)
+                    while any(not result.ready() for result in results):
+                        current_progress = sum(progress_dict.values())
+                        normalised_progress = current_progress / total_progress
+                        if normalised_progress == 0:
+                            continue
+                        elapsed_time = time.time() - time_started
+                        projected_finish_time = (
+                            time_started + elapsed_time / normalised_progress
+                        )
+                        finish_time = datetime.datetime.fromtimestamp(
+                            projected_finish_time
+                        )
+                        done_count = len(
+                            [v for v in progress_dict.values() if v == 1]
+                        )
+                        in_progress_count = len(
+                            [v for v in progress_dict.values() if 0 < v < 1]
+                        )
+                        unstarted_count = (
+                            len(results) - done_count - in_progress_count
+                        )
+                        print(
+                            f"Progress {normalised_progress:.2%}, projected "
+                            f"finish time {finish_time.isoformat()}. "
+                            f"Done: {done_count}, "
+                            f"in progress: {in_progress_count}, "
+                            f"yet to start: {unstarted_count}. ",
+                            end="\r",
+                        )
+                        time.sleep(1)
+                self.solutions = {
+                    sol for result in results for sol in result.get()
+                }
             else:
                 self._solve()
         finally:
-            if with_terminal:
-                print(
-                    "{} {} found!".format(
-                        len(self.solutions),
-                        "solution" if len(self.solutions) == 1 else "solutions",
-                    )
+            print(
+                "{} {} found!".format(
+                    len(self.solutions),
+                    "solution" if len(self.solutions) == 1 else "solutions",
                 )
-                for i, solution in enumerate(self.solutions):
-                    print(f"SOLUTION {i}".center(30, "-"))
-                    self.simple_draw(solution)
+            )
+            for i, solution in enumerate(self.solutions):
+                print(f"SOLUTION {i}".center(30, "-"))
+                self.simple_draw(solution)
+
+            total_possibles = [False for _ in range(len(self.possibles))]
+            for solution in self.solutions:
+                for i, possible in enumerate(solution):
+                    total_possibles[i] |= possible
+
+            print("COMBINED SOLUTION".center(30, "-"))
+            self.simple_draw(total_possibles)
 
     def _solve(self, screen=None):
         self.screen = screen
         self._init_colors()
-        self._solve_or_bifurcate()
+        output = self._solve_or_bifurcate()
+        self._update_multiprocess_progress(override_value=1)
+        return output
 
     def _solve_or_bifurcate(self):
         self._logical_solve_til_no_change()
         if self.is_finished:
-            return
+            return copy.deepcopy(self.solutions)
         idxs_to_bifurcate = self._select_bifurcation_coveree()
         for bifurcation_num, idx in enumerate(idxs_to_bifurcate):
             try:
                 with self._bifurcate(
                     idx, len(idxs_to_bifurcate), bifurcation_num
                 ):
+                    self._refresh_screen()
                     self._solve_or_bifurcate()
             except SudokuContradiction:
                 self.possibles[idx] = False
 
+        try:
+            self._logical_solve_til_no_change()
+        except SudokuContradiction:
+            return set()
+        return copy.deepcopy(self.solutions)
+
+    def _list_bifurcations(
+        self, current_bifurcations=None, trivial_bifurcations=None
+    ):
+        """Simulate a few branches of a solve to get a list of bifurcations."""
+        current_bifurcations = current_bifurcations or []
+        trivial_bifurcations = trivial_bifurcations or []
+        level = 0 if not current_bifurcations else len(current_bifurcations[0])
+        print(
+            f"Enumerating bifurcations: found {len(current_bifurcations)}/"
+            f"{MULTIPROCESS_TASK_COUNT} on level {level}",
+            end="\r",
+        )
+
         self._logical_solve_til_no_change()
+        if self.is_finished:
+            return []
+
+        if len(current_bifurcations) > MULTIPROCESS_TASK_COUNT:
+            return current_bifurcations + trivial_bifurcations
+
+        next_level_bifurcations = []
+        for existing_bifurcations in current_bifurcations or [[]]:
+            with contextlib.ExitStack() as stack:
+                for idx in existing_bifurcations:
+                    stack.enter_context(self._bifurcate(idx, 1, 1))
+
+                idxs_to_bifurcate = self._select_bifurcation_coveree()
+                for new_idx in idxs_to_bifurcate:
+                    try:
+                        with self._bifurcate(new_idx, 1, 1):
+                            bifurcations_copy = copy.deepcopy(
+                                self.bifurcation_indices
+                            )
+                            if self.is_finished:
+                                trivial_bifurcations.append(bifurcations_copy)
+                            else:
+                                next_level_bifurcations.append(
+                                    bifurcations_copy
+                                )
+                    except SudokuContradiction:
+                        self.possibles[new_idx] = False
+
+        if not next_level_bifurcations:
+            return current_bifurcations + trivial_bifurcations
+        return self._list_bifurcations(
+            current_bifurcations=next_level_bifurcations,
+            trivial_bifurcations=trivial_bifurcations,
+        )
 
     def _logical_solve_til_no_change(self):
         old_possibles = None
@@ -106,7 +231,6 @@ class Puzzle:
             for constraint in self.constraints:
                 constraint.act_on_grid()
             self.process_singleton_coverees()
-            self._refresh_screen()
             old_possibles = tuple(self.possibles)
             old_finalised = tuple(self.finalised)
 
@@ -175,7 +299,6 @@ class Puzzle:
         self.finalised = copy.deepcopy(self.finalised)
         try:
             self.bifurcations.append(bifurcation)
-            debug_solutions_before_bifurcate = len(self.solutions)
             self.finalise([index])
             yield
         except SudokuContradiction:
@@ -323,13 +446,24 @@ class Puzzle:
         curses.init_pair(2, 88, -1)  # Non-primary bifurcation
         curses.init_pair(3, 0, -1)  # Unbifurcated possible
 
-    def _refresh_screen(self):
-        if self.screen is None:
-            return
-        if time.time() - self.last_frame_time < 1 / FRAME_RATE:
+    def _update_multiprocess_progress(self, override_value=None):
+        if (
+            self.multiprocess_progress_dict is not None
+            and self.multiprocessing_id is not None
+        ):
+            self.multiprocess_progress_dict[self.multiprocessing_id] = (
+                override_value or self.progress
+            )
             return
 
+    def _refresh_screen(self):
+        if time.time() - self.last_frame_time < 1 / FRAME_RATE:
+            return
         self.last_frame_time = time.time()
+        self._update_multiprocess_progress()
+        if self.screen is None:
+            return
+
         self.screen.erase()
 
         self.screen.addstr(
@@ -402,7 +536,6 @@ class Puzzle:
                 bifurcation.current_option_num / bifurcation.num_options
             ) * current_subdivision
             current_subdivision *= 1 / bifurcation.num_options
-
         return registered_progress
 
     @property
@@ -414,6 +547,10 @@ class Puzzle:
         total_time = time_elapsed / progress
         finish_timestamp = self.solve_start_time + total_time
         return datetime.datetime.fromtimestamp(finish_timestamp).isoformat()
+
+    @property
+    def bifurcation_indices(self):
+        return [bifurcation.index for bifurcation in self.bifurcations]
 
     @staticmethod
     def _possibles_to_draw_coords(possibles: np.ndarray) -> np.ndarray:
