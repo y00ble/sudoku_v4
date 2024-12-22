@@ -347,7 +347,7 @@ class DiagonalNoBlackKropki(Constraint):
                     for v1, v2 in itertools.product(range(1, 10), repeat=2):
                         i1 = self.puzzle.possible_index(r1, c1, v1)
                         i2 = self.puzzle.possible_index(r2, c2, v2)
-                        if v1 * 3 == v2 or v2 * 3 == v1:
+                        if v1 + v2 == 8:
                             self.puzzle.add_contradiction(i1, i2)
 
     def initialise_on_grid(self) -> None:

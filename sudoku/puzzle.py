@@ -10,7 +10,6 @@ import time
 from multiprocessing import Manager, Pool
 
 import numpy as np
-from nbformat import current_nbformat
 
 from sudoku.constraints import DIGITS, Box, Column, Row
 from sudoku.exceptions import SudokuContradiction
@@ -28,7 +27,7 @@ Bifurcation = collections.namedtuple(
     ["index", "possibles", "finalised", "num_options", "current_option_num"],
 )
 
-MULTIPROCESS_TASK_COUNT = 100
+MULTIPROCESS_TASK_COUNT = 50
 
 
 class Puzzle:
@@ -57,6 +56,8 @@ class Puzzle:
 
         self.multiprocess_progress_dict = None
         self.multiprocessing_id = None
+        self.multiprocess_solution_count = None
+        self.multiprocess_lock = None
 
         self._init_grid_constraints()
 
@@ -78,11 +79,15 @@ class Puzzle:
                 results = []
                 with Manager() as manager, Pool() as pool:
                     progress_dict = manager.dict()
+                    solution_counts = manager.dict()
+                    multi_lock = manager.Lock()
                     for i, bifurcation_idxs in enumerate(bifurcations_to_try):
                         puzzle = copy.deepcopy(self)
                         puzzle.finalise(bifurcation_idxs)
                         puzzle.multiprocess_progress_dict = progress_dict
                         puzzle.multiprocessing_id = i
+                        puzzle.multiprocess_solution_count = solution_counts
+                        puzzle.multiprocess_lock = multi_lock
                         results.append(pool.apply_async(puzzle._solve))
 
                     time_started = time.time()
@@ -99,24 +104,36 @@ class Puzzle:
                         finish_time = datetime.datetime.fromtimestamp(
                             projected_finish_time
                         )
-                        done_count = len(
-                            [v for v in progress_dict.values() if v == 1]
-                        )
+                        # TODO technically this isn't thread safe.
+                        with multi_lock:
+                            progress_values = copy.deepcopy(
+                                progress_dict.values()
+                            )
+                            solution_counts_copy = copy.deepcopy(
+                                solution_counts
+                            )
+
+                        done_count = len([v for v in progress_values if v == 1])
                         in_progress_count = len(
-                            [v for v in progress_dict.values() if 0 < v < 1]
+                            [v for v in progress_values if 0 < v < 1]
                         )
                         unstarted_count = (
                             len(results) - done_count - in_progress_count
+                        )
+                        solution_count = sum(
+                            count for count in solution_counts_copy.values()
                         )
                         print(
                             f"Progress {normalised_progress:.2%}, projected "
                             f"finish time {finish_time.isoformat()}. "
                             f"Done: {done_count}, "
                             f"in progress: {in_progress_count}, "
-                            f"yet to start: {unstarted_count}. ",
+                            f"yet to start: {unstarted_count}. "
+                            f"Found {solution_count} solutions.",
                             end="\r",
                         )
                         time.sleep(1)
+
                 self.solutions = {
                     sol for result in results for sol in result.get()
                 }
@@ -333,6 +350,11 @@ class Puzzle:
 
     def _add_solution(self, indices):
         self.solutions.add(tuple(self.possibles))
+        if self.multiprocess_lock is not None:
+            with self.multiprocess_lock:
+                self.multiprocess_solution_count[self.multiprocessing_id] = len(
+                    self.solutions
+                )
         self.in_valid_solutions[self.possibles] = True
 
     def process_singleton_coverees(self) -> None:
@@ -447,13 +469,11 @@ class Puzzle:
         curses.init_pair(3, 0, -1)  # Unbifurcated possible
 
     def _update_multiprocess_progress(self, override_value=None):
-        if (
-            self.multiprocess_progress_dict is not None
-            and self.multiprocessing_id is not None
-        ):
-            self.multiprocess_progress_dict[self.multiprocessing_id] = (
-                override_value or self.progress
-            )
+        if self.multiprocess_lock is not None:
+            with self.multiprocess_lock:
+                self.multiprocess_progress_dict[self.multiprocessing_id] = (
+                    override_value or self.progress
+                )
             return
 
     def _refresh_screen(self):
